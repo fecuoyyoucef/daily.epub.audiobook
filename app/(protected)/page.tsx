@@ -13,9 +13,16 @@ export default function Home(){
   async function upload(event:FormEvent<HTMLFormElement>){
     event.preventDefault();if(!file||!rights)return;
     if(file.size>MAX_FILE_BYTES){setMessage("الحد الأقصى لحجم EPUB هو 15 MB.");return;}
-    setBusy(true);setUploadProgress(0);setMessage("يجري رفع ملف EPUB على أجزاء...");
+    setBusy(true);setUploadProgress(0);setMessage("يجري تجهيز رفع خاص وآمن...");
     try{
-      const uploadId=crypto.randomUUID();const totalParts=Math.ceil(file.size/CHUNK_BYTES);
+      const totalParts=Math.ceil(file.size/CHUNK_BYTES);
+      const initialization=await fetch("/api/upload",{
+        method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({fileName:file.name,fileSize:file.size,totalParts,rightsConfirmation:rights,replace,idempotencyKey:crypto.randomUUID()})
+      });
+      const initialized=await initialization.json();
+      if(!initialization.ok)throw new Error(initialized.error||"تعذّر بدء الرفع.");
+      const uploadId=initialized.uploadId as string;
       for(let index=0;index<totalParts;index++){
         const part=file.slice(index*CHUNK_BYTES,Math.min((index+1)*CHUNK_BYTES,file.size));
         const form=new FormData();form.append("uploadId",uploadId);form.append("index",String(index));form.append("total",String(totalParts));form.append("chunk",part,`part-${index}.bin`);
@@ -23,10 +30,10 @@ export default function Home(){
         if(!response.ok)throw new Error(data.error||`فشل رفع الجزء ${index+1}.`);
         setUploadProgress(Math.round((index+1)/totalParts*85));
       }
-      setMessage("اكتمل الرفع. يجري فحص EPUB واستخراج الفصول...");
-      const response=await fetch("/api/upload/complete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({uploadId,fileName:file.name,fileSize:file.size,totalParts,rightsConfirmation:rights,replace})});
-      const data=await response.json();if(!response.ok)throw new Error(data.error||"فشل تحليل الكتاب.");
-      setUploadProgress(100);setMessage(`تم تسجيل "${data.title}" بنجاح: ${data.chapters} فصلاً و${data.parts} جزءاً صوتياً.`);
+      setMessage("اكتمل رفع الملف. يجري الآن استخراجه في مهمة مستمرة...");
+      const response=await fetch("/api/upload/complete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({uploadId})});
+      const data=await response.json();if(!response.ok)throw new Error(data.error||"تعذّر بدء استخراج الكتاب.");
+      setUploadProgress(100);setMessage("تم استلام الكتاب وبدء استخراجه. ستظهر الفصول عند اكتمال المهمة.");
       setFile(null);setRights(false);setReplace(false);const input=document.getElementById("epub") as HTMLInputElement|null;if(input)input.value="";await refresh();
     }catch(error){setMessage(error instanceof Error?error.message:"حدث خطأ أثناء الرفع.");}
     finally{setBusy(false);}
@@ -34,7 +41,7 @@ export default function Home(){
   async function runNow(){
     setBusy(true);setMessage("يجري تنفيذ الدفعة الصوتية اليومية...");
     try{const response=await fetch("/api/run-now",{method:"POST"});const data=await response.json();if(!response.ok||data.ok===false)throw new Error(data.error||"تعذّر تشغيل الدفعة.");
-      setMessage(data.skipped?data.reason:data.message||`اكتملت الدفعة: ${data.chaptersCompletedThisRun} فصول، و${data.requestsUsedThisRun} طلبات TTS.`);await refresh();
+      setMessage(data.skipped?data.reason:data.status==="already_running"?"توجد مهمة صوتية قيد التنفيذ بالفعل.":`بدأت مهمة صوتية لمعالجة ${data.chapters??0} فصول.`);await refresh();
     }catch(error){setMessage(error instanceof Error?error.message:"حدث خطأ.");await refresh();}
     finally{setBusy(false);}
   }
@@ -47,14 +54,17 @@ export default function Home(){
   }
   const book=status?.book;const usage=book?.dailyUsage??{requestsUsed:0,chaptersCompleted:0};
   return <main className="wrap">
-    <div className="nav"><div className="brand">قارئ الكتب الصوتي</div><div className="navlinks"><Link className="active" href="/">الرئيسية</Link><Link href="/listen">الاستماع</Link><Link href="/settings">الإعدادات</Link></div></div>
+    <div className="nav"><div className="brand">قارئ الكتب الصوتي</div><div className="navlinks"><Link className="active" href="/">الرئيسية</Link><Link href="/studio/manual">استوديو الإنتاج</Link><Link href="/listen">الاستماع</Link><Link href="/settings">الإعدادات</Link></div></div>
     <div className="eyebrow">DAILY EPUB AUDIOBOOK</div><h1 className="title">مكتبتك الصوتية، فصلًا بعد فصل</h1>
     <p className="sub">ارفع ملف EPUB مرة واحدة، وحدد نطاق الفصول والهدف اليومي. يتولى Gemini توليد الصوت، ويحفظ التطبيق الفصول المكتملة في مكتبة خاصة.</p>
     {!status?.configured&&<div className="notice">مفتاح Gemini غير مضبوط. أضف GEMINI_API_KEY في Vercel → Settings → Environment Variables ثم أعد نشر التطبيق.</div>}
     {message&&<div className="notice ok">{message}{busy&&uploadProgress>0&&<div className="progress"><i style={{width:`${uploadProgress}%`}}/></div>}</div>}
-    <section className="card"><div className="row space"><h2>حالة الكتاب</h2>{book&&<span className="pill">{book.enabled?"الجدولة مفعّلة":"الجدولة متوقفة"}</span>}</div>
+    <section className="card"><div className="row space"><h2>حالة الكتاب</h2>{book&&<span className="pill">{book.status!=="ready"?"يجري استيراد الكتاب":book.enabled?"الجدولة مفعّلة":"الجدولة متوقفة"}</span>}</div>
       {!book?<p className="muted">لا يوجد كتاب في المكتبة بعد. ارفع ملف EPUB للبدء.</p>:<>
         <h3>{book.title}</h3><p className="muted">{book.filename}</p>
+        {book.status!=="ready"&&<p className="small" role="status" aria-live="polite">يُستخرج محتوى الكتاب في الخلفية. ستظهر الفصول بعد اكتمال الاستيراد.</p>}
+        {book.activeJob&&<p className="small" role="status" aria-live="polite">معالجة صوتية جارية: {book.activeJob.completedChapters}/{book.activeJob.totalChapters} فصول، {book.activeJob.completedParts}/{book.activeJob.totalParts} أجزاء، {book.activeJob.requestsUsed+book.activeJob.requestsReserved} طلبات مستخدمة أو محجوزة.</p>}
+        {!book.activeJob&&book.lastRun?.message&&<p className="small" role="status">{book.lastRun.message}</p>}
         <div className="grid" style={{marginTop:16}}>
           <div className="stat"><strong>{book.selectedCompleted}/{book.selectedTotal}</strong><span className="muted">فصول مكتملة في النطاق</span></div>
           <div className="stat"><strong>{usage.requestsUsed}/10</strong><span className="muted">طلبات TTS اليوم</span></div>
@@ -64,9 +74,9 @@ export default function Home(){
         <p className="small">النطاق الحالي: {book.settings.startChapter}–{book.settings.endChapter} من {book.total} · التقدم الإجمالي {book.progress}%</p>
         {book.next&&<p className="small">الفصل التالي: {book.next.number} — {book.next.title} ({book.next.partsCompleted}/{book.next.partsTotal} أجزاء)</p>}
         <div className="row" style={{marginTop:14}}>
-          <button className="btn" onClick={runNow} disabled={busy||!status?.configured||!book.enabled||usage.requestsUsed>=10}>تشغيل الدفعة الآن</button>
+          <button className="btn" onClick={runNow} disabled={busy||!status?.configured||usage.requestsUsed>=10}>تشغيل الدفعة الآن</button>
           <button className="btn secondary" onClick={toggleAutomation} disabled={busy}>{book.enabled?"إيقاف الجدولة":"استئناف الجدولة"}</button>
-          <Link className="btn ghost" href="/listen">افتح مشغل الصوت</Link><Link className="btn ghost" href="/settings">إعدادات النطاق</Link>
+          <Link className="btn ghost" href={`/read/${book.id}`}>اقرأ الكتاب</Link><Link className="btn ghost" href="/listen">افتح مشغل الصوت</Link><Link className="btn ghost" href="/settings">إعدادات النطاق</Link>
         </div>
       </>}
     </section>
