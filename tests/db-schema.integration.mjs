@@ -49,6 +49,33 @@ try {
     [userId, bookId, chapterId],
   )
 
+  const uploadResult = await client.query(
+    `INSERT INTO uploads (user_id, original_filename, content_type, size_bytes, chunk_count, status, rights_confirmed_at, idempotency_key, expires_at)
+     VALUES ($1, $2, $3, $4, 1, 'uploading', now(), $5, now() + interval '1 day')
+     RETURNING id`,
+    [userId, 'schema-test.epub', 'application/epub+zip', 128, randomUUID()],
+  )
+  const uploadId = uploadResult.rows[0].id
+  const uploadPartValues = [uploadId, userId, 0, `uploads/${userId}/${uploadId}/part-00.bin`, 'a'.repeat(64), 128]
+  await client.query(
+    `INSERT INTO upload_parts (upload_id, user_id, part_index, blob_path, sha256, size_bytes)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (upload_id, part_index) DO UPDATE
+     SET blob_path = EXCLUDED.blob_path, sha256 = EXCLUDED.sha256, size_bytes = EXCLUDED.size_bytes`,
+    uploadPartValues,
+  )
+  await client.query(
+    `INSERT INTO upload_parts (upload_id, user_id, part_index, blob_path, sha256, size_bytes)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (upload_id, part_index) DO UPDATE
+     SET blob_path = EXCLUDED.blob_path, sha256 = EXCLUDED.sha256, size_bytes = EXCLUDED.size_bytes`,
+    uploadPartValues,
+  )
+  const uploadPartsResult = await client.query(
+    'SELECT count(*)::int AS count FROM upload_parts WHERE upload_id = $1 AND user_id = $2',
+    [uploadId, userId],
+  )
+
   const jobResult = await client.query(
     'INSERT INTO audio_jobs (user_id, book_id, mode, idempotency_key) VALUES ($1, $2, $3, $4) RETURNING id',
     [userId, bookId, 'manual', randomUUID()],
@@ -92,6 +119,7 @@ try {
   console.log(JSON.stringify({
     database: databaseResult.rows[0].name,
     chapterAndProgressRoundTrip: progressResult.rows[0].progress_percent === '37.50',
+    uploadChunkUpsert: Number(uploadPartsResult.rows[0].count) === 1,
     quotaIdempotencyConstraint: idempotencyConstraintWorks,
     userScopedLookup: scopedResult.rowCount === 0,
     rolledBack: true,
