@@ -14,7 +14,8 @@ export async function POST(request:NextRequest){
     return NextResponse.json(result);
   }catch(error){
     if(error instanceof UploadServiceError) return NextResponse.json({error:error.message},{status:error.status});
-    console.error("[upload] Chunk save failed",error instanceof Error?error.name:"UnknownError");
+    const code=error&&typeof error==="object"&&"code"in error?(error as {code?:unknown}).code:undefined;
+    console.error("[upload] Chunk save failed",{name:error instanceof Error?error.name:"UnknownError",code:typeof code==="string"||typeof code==="number"?String(code).slice(0,40):undefined});
     return NextResponse.json({error:"تعذّر حفظ جزء الملف."},{status:500});
   }
 }
