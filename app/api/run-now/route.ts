@@ -11,7 +11,14 @@ export async function POST(request: Request) {
   if (!isSameOriginRequest(request)) return forbiddenOriginResponse()
 
   try {
-    const result = await queueAudioJob(owner.id, 'manual')
+    const body = await request.json().catch(() => ({})) as { retryUncertain?: unknown } | null
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return NextResponse.json({ ok: false, error: 'بيانات التشغيل غير صالحة.' }, { status: 400 })
+    }
+    if (body.retryUncertain !== undefined && typeof body.retryUncertain !== 'boolean') {
+      return NextResponse.json({ ok: false, error: 'قيمة إعادة المحاولة غير صالحة.' }, { status: 400 })
+    }
+    const result = await queueAudioJob(owner.id, 'manual', undefined, { retryUncertain: body.retryUncertain === true })
     return NextResponse.json({ ok: true, ...result }, { status: 'skipped' in result ? 200 : 202 })
   } catch (error) {
     if (error instanceof AudioJobError) {

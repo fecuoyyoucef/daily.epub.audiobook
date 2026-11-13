@@ -8,7 +8,7 @@ export default async function ManualStudioPage() {
   const owner = await getCurrentOwner()
   const initialStatus = owner
     ? await getLibraryStatus(owner.id)
-    : { configured: false, book: null }
+    : { book: null }
 
   return <ManualStudio initialStatus={initialStatus} />
 }

@@ -12,7 +12,6 @@ type Chapter = {
 }
 
 type LibraryStatus = {
-  configured: boolean
   book: {
     title: string
     status: string
@@ -107,7 +106,6 @@ export default function ManualStudio({ initialStatus }: { initialStatus: Library
       <h1 className="title">استوديو الإنتاج اليدوي</h1>
       <p className="sub">اختر الفصول التي تريد تحويلها. تُحفظ كل قطعة مكتملة، ويستأنف النظام من الجزء المتبقي من دون تكرار الطلبات المحسومة.</p>
 
-      {!status.configured && <div className="notice">توليد الصوت غير مهيأ في بيئة التشغيل الحالية.</div>}
       {message && <div className="notice ok" role="status" aria-live="polite">{message}</div>}
 
       <section className="card" aria-labelledby="studio-book-title">
@@ -160,7 +158,7 @@ export default function ManualStudio({ initialStatus }: { initialStatus: Library
           </div>}
 
           <div className="row" style={{ marginTop: 16 }}>
-            <button className="btn" type="button" onClick={queueSelected} disabled={submitting || !selected.length || !status.configured || !!book.activeJob}>
+            <button className="btn" type="button" onClick={queueSelected} disabled={submitting || !selected.length || !!book.activeJob}>
               {submitting ? 'جارٍ إنشاء المهمة...' : `إضافة ${selected.length || ''} إلى قائمة الإنتاج`}
             </button>
             <span className="small">تُطبق الحصة اليومية المشتركة البالغة 10 طلبات على الإنتاج اليدوي والآلي.</span>

@@ -79,14 +79,15 @@ export async function startAudioRun(userId: string, jobId: string): Promise<stri
   }
 }
 
-export async function queueAudioJob(userId: string, mode: 'manual' | 'automatic', selectedChapterNumbers?: number[]) {
+export async function queueAudioJob(
+  userId: string,
+  mode: 'manual' | 'automatic',
+  selectedChapterNumbers?: number[],
+  options: { retryUncertain?: boolean } = {},
+) {
   const book = await getActiveBook(userId)
   if (!book) throw new AudioJobError('لا يوجد كتاب في المكتبة.', 404)
   if (book.status !== 'ready') throw new AudioJobError('لا يزال استيراد الكتاب قيد التنفيذ.', 409)
-  if (mode === 'automatic' && !process.env.GEMINI_API_KEY) {
-    throw new AudioJobError('توليد الصوت غير مهيأ.', 503)
-  }
-
   const [activeJob] = await db
     .select({ id: audioJobs.id, workflowRunId: audioJobs.workflowRunId })
     .from(audioJobs)
@@ -102,8 +103,6 @@ export async function queueAudioJob(userId: string, mode: 'manual' | 'automatic'
     const workflowRunId = await startAudioRun(userId, activeJob.id)
     return { jobId: activeJob.id, workflowRunId, status: 'already_running' as const }
   }
-
-  if (!process.env.GEMINI_API_KEY) throw new AudioJobError('توليد الصوت غير مهيأ.', 503)
 
   const [lastChapter] = await db
     .select({ number: bookChapters.chapterNumber })
@@ -182,12 +181,16 @@ export async function queueAudioJob(userId: string, mode: 'manual' | 'automatic'
       inArray(audioParts.chapterId, candidateChapterIds),
     ))
 
+  const retryUncertain = mode === 'manual' && options.retryUncertain === true
   const partCounts = new Map<string, { total: number; completed: number; processable: number }>()
   for (const part of allParts) {
     const counts = partCounts.get(part.chapterId) ?? { total: 0, completed: 0, processable: 0 }
     counts.total += 1
     if (part.status === 'completed') counts.completed += 1
-    if ((part.status === 'pending' || part.status === 'failed') && part.attemptCount < MAX_PART_ATTEMPTS) counts.processable += 1
+    const isRetryable = part.status === 'pending'
+      || part.status === 'failed'
+      || retryUncertain && part.status === 'uncertain'
+    if (isRetryable && part.attemptCount < MAX_PART_ATTEMPTS) counts.processable += 1
     partCounts.set(part.chapterId, counts)
   }
   const chaptersToProcess = selectedChapters
@@ -202,7 +205,7 @@ export async function queueAudioJob(userId: string, mode: 'manual' | 'automatic'
 
   const selectedIds = new Set(chaptersToProcess.map((chapter) => chapter.id))
   const selectedParts = allParts.filter((part) => selectedIds.has(part.chapterId)
-    && (part.status === 'pending' || part.status === 'failed')
+    && (part.status === 'pending' || part.status === 'failed' || retryUncertain && part.status === 'uncertain')
     && part.attemptCount < MAX_PART_ATTEMPTS)
   const totalParts = chaptersToProcess.reduce((total, chapter) => total + (partCounts.get(chapter.id)?.total ?? 0), 0)
   const completedParts = chaptersToProcess.reduce((total, chapter) => total + (partCounts.get(chapter.id)?.completed ?? 0), 0)
@@ -237,6 +240,18 @@ export async function queueAudioJob(userId: string, mode: 'manual' | 'automatic'
       })
       .returning({ id: audioJobs.id })
 
+    const uncertainPartIds = selectedParts.filter((part) => part.status === 'uncertain').map((part) => part.id)
+    if (uncertainPartIds.length) {
+      await transaction
+        .update(audioParts)
+        .set({ status: 'pending' })
+        .where(and(
+          eq(audioParts.userId, userId),
+          inArray(audioParts.id, uncertainPartIds),
+          eq(audioParts.status, 'uncertain'),
+        ))
+    }
+
     await transaction.insert(audioJobItems).values(chaptersToProcess.map((chapter, sequence) => ({
       userId,
       jobId: job.id,
@@ -251,7 +266,7 @@ export async function queueAudioJob(userId: string, mode: 'manual' | 'automatic'
       userId,
       audioJobId: job.id,
       eventType: 'audio.queued',
-      payload: { mode, chapters: chaptersToProcess.length, parts: selectedParts.length },
+      payload: { mode, chapters: chaptersToProcess.length, parts: selectedParts.length, retryUncertain },
     })
     return { id: job.id, alreadyRunning: false }
   })

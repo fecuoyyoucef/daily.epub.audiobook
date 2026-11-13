@@ -18,6 +18,7 @@ import {
 } from '@/lib/db/schema'
 
 const DEFAULT_MODEL = GEMINI_TTS_MODEL
+const MAX_PART_ATTEMPTS = 3
 const DEFAULT_VOICE = 'Kore'
 const DEFAULT_LANGUAGE = 'ar-XA'
 const DEFAULT_STYLE = 'Natural Arabic audiobook narration in clear Modern Standard Arabic. Read the supplied text verbatim, without summarizing, skipping, or adding commentary. Use measured pacing and restrained expressive delivery.'
@@ -166,7 +167,7 @@ export async function updateAudioSettings(
 
 export async function getLibraryStatus(userId: string) {
   const book = await getActiveBook(userId)
-  if (!book) return { configured: Boolean(process.env.GEMINI_API_KEY), book: null }
+  if (!book) return { book: null }
 
   const [chapterCountRow] = await db
     .select({ total: bookChapters.chapterNumber })
@@ -205,7 +206,7 @@ export async function getLibraryStatus(userId: string) {
     .orderBy(asc(bookChapters.chapterNumber))
 
   const partRows = await db
-    .select({ chapterId: audioParts.chapterId, status: audioParts.status })
+    .select({ chapterId: audioParts.chapterId, status: audioParts.status, attemptCount: audioParts.attemptCount })
     .from(audioParts)
     .where(and(
       eq(audioParts.userId, userId),
@@ -216,18 +217,19 @@ export async function getLibraryStatus(userId: string) {
       eq(audioParts.styleHash, currentStyleHash),
     ))
 
-  const partCounts = new Map<string, { total: number; completed: number; failed: number; uncertain: number }>()
+  const partCounts = new Map<string, { total: number; completed: number; failed: number; uncertain: number; retryable: number }>()
   for (const part of partRows) {
-    const current = partCounts.get(part.chapterId) ?? { total: 0, completed: 0, failed: 0, uncertain: 0 }
+    const current = partCounts.get(part.chapterId) ?? { total: 0, completed: 0, failed: 0, uncertain: 0, retryable: 0 }
     current.total += 1
     if (part.status === 'completed') current.completed += 1
     if (part.status === 'failed') current.failed += 1
     if (part.status === 'uncertain') current.uncertain += 1
+    if ((part.status === 'failed' || part.status === 'uncertain') && part.attemptCount < MAX_PART_ATTEMPTS) current.retryable += 1
     partCounts.set(part.chapterId, current)
   }
 
   const chapters = chapterRows.map((chapter) => {
-    const counts = partCounts.get(chapter.id) ?? { total: 0, completed: 0, failed: 0, uncertain: 0 }
+    const counts = partCounts.get(chapter.id) ?? { total: 0, completed: 0, failed: 0, uncertain: 0, retryable: 0 }
     const status = chapter.assetStatus === 'ready'
       ? 'completed'
       : chapter.importStatus === 'ready'
@@ -244,6 +246,9 @@ export async function getLibraryStatus(userId: string) {
       status,
       partsCompleted: counts.completed,
       partsTotal: counts.total,
+      partsFailed: counts.failed,
+      partsUncertain: counts.uncertain,
+      retryableParts: counts.retryable,
       audioUrl: chapter.assetStatus === 'ready' ? `/api/audio?chapter=${chapter.number}` : null,
       error: status === 'error' ? 'توجد أجزاء لم تكتمل أو لم تُحسم نتيجتها.' : null,
     }
@@ -252,6 +257,7 @@ export async function getLibraryStatus(userId: string) {
   const selectedChapters = chapters.filter((chapter) => chapter.number >= settings.startChapter && chapter.number <= settings.endChapter)
   const completed = chapters.filter((chapter) => chapter.status === 'completed').length
   const selectedCompleted = selectedChapters.filter((chapter) => chapter.status === 'completed').length
+  const retryableParts = selectedChapters.reduce((total, chapter) => total + chapter.retryableParts, 0)
   const [usage] = await db
     .select({ requestsReserved: dailyUsage.requestsReserved, requestsCommitted: dailyUsage.requestsCommitted })
     .from(dailyUsage)
@@ -287,7 +293,6 @@ export async function getLibraryStatus(userId: string) {
     : null
 
   return {
-    configured: Boolean(process.env.GEMINI_API_KEY),
     book: {
       id: book.id,
       title: book.title,
@@ -300,6 +305,7 @@ export async function getLibraryStatus(userId: string) {
       settings,
       selectedTotal: selectedChapters.length,
       selectedCompleted,
+      retryableParts,
       dailyUsage: {
         date: today,
         requestsUsed: Number(usage?.requestsReserved ?? 0) + Number(usage?.requestsCommitted ?? 0),

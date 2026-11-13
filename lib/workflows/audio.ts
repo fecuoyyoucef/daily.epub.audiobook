@@ -56,6 +56,10 @@ function settingsFromSnapshot(value: unknown): AudioSettingsSnapshot {
   }
 }
 
+function hasWavHeader(audio: Buffer): boolean {
+  return audio.length >= 44 && audio.toString('ascii', 0, 4) === 'RIFF' && audio.toString('ascii', 8, 12) === 'WAVE'
+}
+
 function pcmFromAudio(audio: Buffer): Buffer {
   if (audio.length < 44 || audio.toString('ascii', 0, 4) !== 'RIFF' || audio.toString('ascii', 8, 12) !== 'WAVE') {
     return audio
@@ -463,6 +467,21 @@ async function settleReservation(
   })
 }
 
+async function putAudioWithRetry(pathname: string, audio: Buffer) {
+  let lastError: unknown
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await putPrivate(pathname, audio, 'audio/wav')
+      return
+    } catch (error) {
+      lastError = error
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)))
+    }
+  }
+  if (lastError instanceof Error) throw lastError
+  throw new Error('Audio storage write failed.')
+}
+
 async function generateAudioPartStep(
   jobId: string,
   userId: string,
@@ -494,11 +513,26 @@ async function generateAudioPartStep(
 
   const blobPath = `audio/${userId}/${part.bookId}/chapter-${String(chapter.chapterNumber).padStart(4, '0')}/part-${String(part.partIndex).padStart(3, '0')}-${part.textSha256.slice(0, 16)}.wav`
   if (part.status === 'generating') {
-    const savedAudio = await readPrivate(blobPath)
+    let savedAudio: Buffer | null
+    try {
+      savedAudio = await readPrivate(blobPath)
+    } catch (error) {
+      console.error('[audio] Existing generated audio could not be checked', error instanceof Error ? error.name : 'UnknownError')
+      await settleReservation(jobId, userId, partId, reservationId, 'uncertain', 'uncertain')
+      return { status: 'uncertain' as const, reason: 'audio_storage_unavailable' }
+    }
     if (savedAudio) {
-      const pcm = pcmFromAudio(savedAudio)
-      const wav = wavFromPcm(pcm)
-      await putPrivate(blobPath, wav, 'audio/wav')
+      let pcm: Buffer
+      let wav: Buffer
+      try {
+        pcm = pcmFromAudio(savedAudio)
+        wav = hasWavHeader(savedAudio) ? savedAudio : wavFromPcm(pcm)
+        if (!hasWavHeader(savedAudio)) await putAudioWithRetry(blobPath, wav)
+      } catch (error) {
+        console.error('[audio] Saved generated audio could not be finalized', error instanceof Error ? error.name : 'UnknownError')
+        await settleReservation(jobId, userId, partId, reservationId, 'committed', 'uncertain')
+        return { status: 'uncertain' as const, reason: 'audio_save_failed' }
+      }
       await settleReservation(jobId, userId, partId, reservationId, 'committed', 'completed', {
         blobPath,
         sha256: sha256(wav),
@@ -515,6 +549,35 @@ async function generateAudioPartStep(
   }
   if (part.status !== 'reserved') return { status: 'failed' as const, reason: 'part_not_reserved' }
 
+  let savedAudio: Buffer | null
+  try {
+    savedAudio = await readPrivate(blobPath)
+  } catch (error) {
+    console.error('[audio] Previous audio could not be checked before retry', error instanceof Error ? error.name : 'UnknownError')
+    await settleReservation(jobId, userId, partId, reservationId, 'released', 'pending')
+    return { status: 'failed' as const, reason: 'audio_read_failed' }
+  }
+  if (savedAudio) {
+    let recoveredAudio: { pcm: Buffer; wav: Buffer } | null = null
+    try {
+      const pcm = pcmFromAudio(savedAudio)
+      const wav = hasWavHeader(savedAudio) ? savedAudio : wavFromPcm(pcm)
+      if (!hasWavHeader(savedAudio)) await putAudioWithRetry(blobPath, wav)
+      recoveredAudio = { pcm, wav }
+    } catch (error) {
+      console.error('[audio] Previous audio could not be recovered', error instanceof Error ? error.name : 'UnknownError')
+    }
+    if (recoveredAudio) {
+      await settleReservation(jobId, userId, partId, reservationId, 'released', 'completed', {
+        blobPath,
+        sha256: sha256(recoveredAudio.wav),
+        sizeBytes: BigInt(recoveredAudio.wav.length),
+        durationMs: BigInt(Math.round(recoveredAudio.pcm.length / 48)),
+      })
+      return { status: 'completed' as const }
+    }
+  }
+
   const [claimed] = await db
     .update(audioParts)
     .set({ status: 'generating' })
@@ -522,18 +585,9 @@ async function generateAudioPartStep(
     .returning({ id: audioParts.id })
   if (!claimed) return { status: 'in_progress' as const }
 
+  let generated: Buffer
   try {
-    const generated = await generateArabicSpeech(text)
-    const pcm = pcmFromAudio(generated)
-    const wav = wavFromPcm(pcm)
-    await putPrivate(blobPath, wav, 'audio/wav')
-    await settleReservation(jobId, userId, partId, reservationId, 'committed', 'completed', {
-      blobPath,
-      sha256: sha256(wav),
-      sizeBytes: BigInt(wav.length),
-      durationMs: BigInt(Math.round(pcm.length / 48)),
-    })
-    return { status: 'completed' as const }
+    generated = await generateArabicSpeech(text)
   } catch (error) {
     if (error instanceof TtsGenerationError && error.kind === 'rate_limited') {
       await settleReservation(jobId, userId, partId, reservationId, 'released', 'pending')
@@ -545,9 +599,40 @@ async function generateAudioPartStep(
       return { status: 'failed' as const, reason: error.kind }
     }
 
+    console.error('[audio] Speech provider request was not confirmed', {
+      name: error instanceof Error ? error.name : 'UnknownError',
+      status: error instanceof TtsGenerationError ? error.status ?? null : null,
+    })
     await settleReservation(jobId, userId, partId, reservationId, 'uncertain', 'uncertain')
     return { status: 'uncertain' as const, reason: 'provider_outcome_unknown' }
   }
+
+  let pcm: Buffer
+  let wav: Buffer
+  try {
+    pcm = pcmFromAudio(generated)
+    wav = wavFromPcm(pcm)
+  } catch (error) {
+    console.error('[audio] Speech provider returned unsupported audio', error instanceof Error ? error.name : 'UnknownError')
+    await settleReservation(jobId, userId, partId, reservationId, 'committed', 'failed')
+    return { status: 'failed' as const, reason: 'invalid_audio' }
+  }
+
+  try {
+    await putAudioWithRetry(blobPath, wav)
+  } catch (error) {
+    console.error('[audio] Generated audio could not be saved', error instanceof Error ? error.name : 'UnknownError')
+    await settleReservation(jobId, userId, partId, reservationId, 'committed', 'uncertain')
+    return { status: 'uncertain' as const, reason: 'audio_save_failed' }
+  }
+
+  await settleReservation(jobId, userId, partId, reservationId, 'committed', 'completed', {
+    blobPath,
+    sha256: sha256(wav),
+    sizeBytes: BigInt(wav.length),
+    durationMs: BigInt(Math.round(pcm.length / 48)),
+  })
+  return { status: 'completed' as const }
 }
 
 async function markItemStatusStep(
@@ -819,8 +904,14 @@ export async function runAudioJobWorkflow(jobId: string, userId: string) {
       if (result?.status !== 'completed') {
         const status = result?.status === 'uncertain' ? 'uncertain' : 'failed'
         const message = status === 'uncertain'
-          ? 'نتيجة الطلب غير مؤكدة؛ لم تتم إعادة المحاولة تلقائياً لتجنب التكرار.'
-          : 'تعذّر توليد أحد الأجزاء الصوتية.'
+          ? result?.reason === 'audio_save_failed'
+            ? 'تم توليد الصوت لكن تعذّر حفظه. أعد المحاولة؛ سيتحقق التطبيق من الملف المحفوظ قبل إرسال طلب جديد.'
+            : 'تعذّر تأكيد رد مزوّد الصوت. أعد المحاولة يدوياً؛ قد تستهلك المحاولة التالية طلباً جديداً.'
+          : result?.reason === 'audio_read_failed'
+            ? 'تعذّر التحقق من ملف محفوظ؛ لم يُرسل طلب صوت جديد. أعد المحاولة بعد قليل.'
+            : result?.reason === 'invalid_audio'
+              ? 'عاد مزوّد الصوت بتنسيق غير صالح؛ يمكنك إعادة المحاولة من لوحة المكتبة.'
+              : 'تعذّر توليد أحد الأجزاء الصوتية.'
         await markItemStatusStep(jobId, userId, item.chapterId, status, message)
         stopReason = message
         failed = true

@@ -58,7 +58,6 @@ export async function processDailyBatch():Promise<Record<string,unknown>>{
   const manifest=await getManifest();
   if(!manifest) return {ok:true,skipped:true,reason:"لا يوجد كتاب مرفوع بعد."};
   if(!manifest.enabled) return {ok:true,skipped:true,reason:"الجدولة متوقفة."};
-  if(!process.env.GEMINI_API_KEY) return {ok:false,configured:false,error:"أضف GEMINI_API_KEY إلى إعدادات Vercel."};
   try{await putLock(`locks/${date}.lock`);}
   catch{return {ok:true,skipped:true,reason:"تم تشغيل مهمة اليوم بالفعل."};}
 
