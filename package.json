@@ -10,9 +10,11 @@
     "test:db-schema": "bash -c 'set -a; source .env.development.local; set +a; node tests/db-schema.integration.mjs'"
   },
   "dependencies": {
+    "@ai-sdk/gateway": "^4.0.143",
     "@base-ui/react": "^1.5.0",
     "@supabase/supabase-js": "^2.119.0",
     "@vercel/analytics": "1.6.1",
+    "ai": "^7.0.170",
     "better-auth": "^1.7.19",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
