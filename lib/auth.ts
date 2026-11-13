@@ -17,6 +17,13 @@ const trustedOrigins = [
   ...(process.env.NODE_ENV === 'development'
     ? [
         'http://localhost:3000',
+        // This exact v0 preview origin is the current workspace fallback when V0_BUILD_URL is absent.
+        ...(!process.env.V0_RUNTIME_URL &&
+        !process.env.V0_DEV_APP_URL &&
+        !process.env.V0_BUILD_URL &&
+        !process.env.V0_SANDBOX_URL
+          ? ['https://workspace-phwnfchz.v0.build']
+          : []),
         ...(process.env.V0_RUNTIME_URL ? [process.env.V0_RUNTIME_URL] : []),
         ...(process.env.V0_DEV_APP_URL ? [process.env.V0_DEV_APP_URL] : []),
         ...(process.env.V0_BUILD_URL ? [process.env.V0_BUILD_URL] : []),
